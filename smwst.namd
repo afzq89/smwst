@@ -1,0 +1,794 @@
+###########################################################################
+# String Method with Swarms of Trajectories (SMwST)
+# Mahmoud Moradi, University of Illinois (moradi@illinois.edu)
+# Modified by Ashkan Fakhar, University of Illinois (afakhar@illinois.edu) 
+# TODO: add remove loops
+###########################################################################
+
+set replica_id [myReplica]
+set image_id [expr $replica_id/$nc]
+set copy_id [expr $replica_id%$nc]
+
+if {![info exists ns]} { set ns 1 }
+if {![string is integer -strict $ns] || $ns < 1} {
+    error "ns must be a positive integer"
+}
+
+if {[llength $cvsd]==1&&[llength $cvs]>1} {
+    set cvd $cvsd
+    for {set i 1} {$i<[llength $cvs]} {incr i} {
+	lappend cvsd $cvd
+    }
+}
+
+if {[llength $cvsm]==1&&[llength $cvs]>1} {
+    set cvm $cvsm
+    for {set i 1} {$i<[llength $cvs]} {incr i} {
+	lappend cvsm $cvm
+    }
+}
+
+###################################
+# input/output setting
+
+source $system_conf
+
+# If you wanna specify an image_id and a copy_id in your output (e.g. output/%s/XX_%s; otherwise just an image_id)
+#set output_name [format $output_root $image_id $copy_id]
+set output_name [format $output_root $image_id]
+
+if { $job_id > 0 } { #restart
+    set old_job_id [expr $job_id-1]
+    set input_name $output_name.job$old_job_id.$replica_id.restart
+} else {
+    # If you have specified an image_id and a copy_id in your input (otherwise just an image_id)
+    #set input_name [format $input_root $image_id $copy_id]
+    set input_name [format $input_root $image_id]
+}
+
+outputname $output_name.job$job_id.$replica_id
+
+if {[info exists input_root]||[info exists old_job_id]} { #do you have *.coor files?
+    bincoordinates $input_name.coor
+}
+if {([info exists input_root]&&$usevel)||[info exists old_job_id]} { #do you have *.vel files?
+    binvelocities $input_name.vel
+} else {
+    if {[info exists temperature]} {
+	temperature $temperature
+    } else {
+	error "temperature is not set!"
+    }
+}
+if {([info exists input_root]&&$usexsc)||[info exists old_job_id]} { #do you have *.xsc files?
+    extendedSystem $input_name.xsc
+    set myxscfile $input_name.xsc
+    if {!$zerotime} { #do you want to keep the time informations
+	set firsttimestepfile $input_name.xsc
+    }
+} else {
+    cellBasisVector1    [lindex $cellinfo 0]
+    cellBasisVector2    [lindex $cellinfo 1]
+    cellBasisVector3    [lindex $cellinfo 2]
+    cellOrigin          [lindex $cellinfo 3]
+}
+
+proc get_firsttime { xscfile } {
+    set fd [open $xscfile r]
+    gets $fd
+    gets $fd
+    gets $fd line
+    set ts [lindex $line 0]
+    close $fd
+    return $ts
+}
+
+if {[info exists firsttimestepfile]} {
+    set firsttime [get_firsttime $myxscfile]
+} else {
+    set firsttime 0
+}
+firsttimestep $firsttime
+#firsttimestep 0
+
+###############################################
+# Some handy variables
+
+# number of replicas
+set nr [numReplicas]
+# number of images
+set ni [expr $nr/$nc]
+
+set nci [expr 1.0/$nc]
+set ncs [expr 1.0/($nc*$ns)]
+set nii [expr 1.0/$ni]
+
+set oneminussmooth [expr 1-$smooth]
+set halfsmooth [expr $smooth/2.0]
+set ni1 [expr $ni-1]; # last image
+
+set random_update $randomized_update
+set fixed_end     $fixed_ends
+set rand_alpha    0.35; # we will adjust this to vary
+
+set num_equil_stages $numStages 
+set equil_steps_per_stage [expr int($runE / $num_equil_stages)]
+set equil_stage_expon 1
+
+set pi  [expr {acos(-1.0)}]
+set r2d [expr {180.0/$pi}]
+set d2r [expr {$pi/180.0}]
+
+set debug 1
+
+# AFX: Conservative center update and adaptive diagonal metric defaults.
+if {![info exists update_fraction]} { set update_fraction 0.2 }
+if {![info exists adaptive_cvsm]} { set adaptive_cvsm 1 }
+if {![info exists cvsm_relaxation]} { set cvsm_relaxation 0.2 }
+if {![info exists cvsm_min]} { set cvsm_min 0.0001 }
+if {![info exists cvsm_max]} { set cvsm_max 0.01 }
+
+if {$update_fraction < 0.0 || $update_fraction > 1.0} {
+    error "update_fraction must be between 0 and 1"
+}
+if {$cvsm_relaxation < 0.0 || $cvsm_relaxation > 1.0} {
+    error "cvsm_relaxation must be between 0 and 1"
+}
+
+# AFX: Restore the string centers and adaptive metric from the previous job.
+if {$replica_id == 0 && $job_id > 0} {
+    set center_state "${output_name}.job${old_job_id}.centers"
+    if {![file readable $center_state]} {
+        error "Cannot read previous string centers: $center_state"
+    }
+
+    set fd [open $center_state r]
+    while {[gets $fd line] >= 0} {
+        if {[llength $line] == 0} { continue }
+        if {[lindex $line 0] eq "cvsm"} {
+            set cvsm [lrange $line 1 end]
+        } else {
+            set I [lindex $line 0]
+            set string_center($I) [lrange $line 1 end]
+        }
+    }
+    close $fd
+
+    if {[array size string_center] != $ni} {
+        error "Expected $ni string centers in $center_state"
+    }
+    #print "AFX Restored cvsm" $cvsm
+}
+
+###############################################
+# Procedures
+
+#proc replica_centers { mycolvars } {
+#    global harm
+#    global cvsd
+#    set mycolvars_d 0
+#    set cnt "centers \{ "
+#    foreach cvd $cvsd {
+#	if { $cvd == 4 } {
+#	    append cnt " ( " [lindex $mycolvars $mycolvars_d] " , " [lindex $mycolvars [expr $mycolvars_d+1]] " , " [lindex $mycolvars [expr $mycolvars_d+2]] " , " [lindex $mycolvars [expr $mycolvars_d+3]] " ) "
+#	} elseif { $cvd == 3 } {
+#	    append cnt " ( " [lindex $mycolvars $mycolvars_d] " , " [lindex $mycolvars [expr $mycolvars_d+1]] " , " [lindex $mycolvars [expr $mycolvars_d+2]] " ) "
+#	} elseif { $cvd == 2 } {
+#	    append cnt " ( " [lindex $mycolvars $mycolvars_d] " , " [lindex $mycolvars [expr $mycolvars_d+1]] " ) "
+#	} elseif { $cvd == 1 } {
+#	    append cnt [lindex $mycolvars $mycolvars_d] " "
+#	} else {
+#	    append cnt [expr "$r2d*atan2([lindex $mycolvars $mycolvars_d],[lindex $mycolvars $mycolvars_d+1])"] " "
+#	    set mycolvars_d [expr $mycolvars_d+1]
+#	}
+#	set mycolvars_d [expr $mycolvars_d+$cvd]
+#    }
+#    append cnt " \}"
+#    return [list $harm "$cnt"]
+#}
+
+proc replica_centers { mycolvars } {
+    global harm cvsd r2d
+    set d 0
+    set cnt "centers \{ "
+
+    foreach cvd $cvsd {
+        if { $cvd == 4 } {
+            append cnt " ( " [lindex $mycolvars $d] " , " [lindex $mycolvars [expr {$d+1}]] " , " \
+                           [lindex $mycolvars [expr {$d+2}]] " , " [lindex $mycolvars [expr {$d+3}]] " ) "
+            set d [expr {$d+4}]
+
+        } elseif { $cvd == 3 } {
+            append cnt " ( " [lindex $mycolvars $d] " , " [lindex $mycolvars [expr {$d+1}]] " , " \
+                           [lindex $mycolvars [expr {$d+2}]] " ) "
+            set d [expr {$d+3}]
+
+        } elseif { $cvd == 2 } {
+            append cnt " ( " [lindex $mycolvars $d] " , " [lindex $mycolvars [expr {$d+1}]] " ) "
+            set d [expr {$d+2}]
+
+        } elseif { $cvd == 1 } {
+            append cnt [lindex $mycolvars $d] " "
+            set d [expr {$d+1}]
+
+        } elseif { $cvd == 0 } {
+            # periodic scalar stored internally as (sin, cos)
+            set s [lindex $mycolvars $d]
+            set c [lindex $mycolvars [expr {$d+1}]]
+            set ang [expr {$r2d * atan2($s, $c)}]  ;# degrees
+
+            # optional: wrap to (-180, 180]
+            if { $ang <= -180.0 } { set ang [expr {$ang + 360.0}] }
+            if { $ang >   180.0 } { set ang [expr {$ang - 360.0}] }
+
+            append cnt $ang " "
+            set d [expr {$d+2}]
+        } else {
+            error "Unsupported cvsd entry: $cvd"
+        }
+    }
+
+    append cnt " \}"
+    return [list $harm "$cnt"]
+}
+
+#proc colvars_length { mycolvars } {
+#    global cvsm
+#    global cvsd
+#    set my_d 0
+#    set my_length 0.0
+#    for { set cv 0 } { $cv < [llength $cvsd] } { incr cv } {
+#	for { set cvd 0 } { $cvd < [lindex $cvsd $cv] } { incr cvd } {
+#	    set my_length [expr "$my_length+[lindex $cvsm $cv]*([lindex $mycolvars $my_d])**2"]
+#	    incr my_d 1
+#	}
+#    }
+#    return [expr "sqrt($my_length)"]
+#}
+
+proc colvars_length { v } {
+    global cvsm cvsd
+    set d 0
+    set sum 0.0
+    for {set cv 0} {$cv < [llength $cvsd]} {incr cv} {
+        set cvd [lindex $cvsd $cv]
+        set w   [lindex $cvsm $cv]
+
+        if { $cvd == 0 } {
+            # periodic scalar stored as 2 comps
+            set x [lindex $v $d]
+            set y [lindex $v [expr {$d+1}]]
+            set sum [expr {$sum + $w*($x*$x + $y*$y)}]
+            set d [expr {$d+2}]
+        } else {
+            for {set k 0} {$k < $cvd} {incr k} {
+                set x [lindex $v [expr {$d+$k}]]
+                set sum [expr {$sum + $w*($x*$x)}]
+            }
+            set d [expr {$d+$cvd}]
+        }
+    }
+    return [expr {sqrt($sum)}]
+}
+
+# AFX: Estimate a common scalar-CV weight from the current string spread.
+# Quaternion weights remain fixed; the scalar weight is relaxed and bounded.
+proc cv_dot { a b } {
+    set value 0.0
+    foreach x $a y $b { set value [expr {$value + $x*$y}] }
+    return $value
+}
+
+proc estimate_cvsm { path } {
+    global cvsd cvsm cvsm_relaxation cvsm_min cvsm_max
+
+    set n [llength $path]
+    set d 0
+    set qvar_sum 0.0
+    set zvar_sum 0.0
+    set qweight_sum 0.0
+    set nq 0
+    set nz 0
+
+    for {set cv 0} {$cv < [llength $cvsd]} {incr cv} {
+        set cvd [lindex $cvsd $cv]
+
+        if {$cvd == 4} {
+            set ref [lrange [lindex $path 0] $d [expr {$d+3}]]
+            set qmean {0.0 0.0 0.0 0.0}
+            set quaternions {}
+
+            foreach point $path {
+                set q [lrange $point $d [expr {$d+3}]]
+                if {[cv_dot $ref $q] < 0.0} { set q [vecscale $q -1.0] }
+                lappend quaternions $q
+                set qmean [vecadd $qmean $q]
+            }
+
+            set qnorm [veclength $qmean]
+            if {$qnorm > 1e-12} { set qmean [vecscale $qmean [expr {1.0/$qnorm}]] }
+
+            set variance 0.0
+            foreach q $quaternions {
+                if {[cv_dot $qmean $q] < 0.0} { set q [vecscale $q -1.0] }
+                set dq [vecsub $q $qmean]
+                set variance [expr {$variance + [cv_dot $dq $dq]}]
+            }
+            set qvar_sum [expr {$qvar_sum + $variance/double($n)}]
+            set qweight_sum [expr {$qweight_sum + [lindex $cvsm $cv]}]
+            incr nq
+            set d [expr {$d+4}]
+
+        } elseif {$cvd == 1} {
+            set mean 0.0
+            foreach point $path { set mean [expr {$mean + [lindex $point $d]}] }
+            set mean [expr {$mean/double($n)}]
+
+            set variance 0.0
+            foreach point $path {
+                set dx [expr {[lindex $point $d] - $mean}]
+                set variance [expr {$variance + $dx*$dx}]
+            }
+            set zvar_sum [expr {$zvar_sum + $variance/double($n)}]
+            incr nz
+            incr d
+
+        } elseif {$cvd == 0} {
+            set d [expr {$d+2}]
+        } else {
+            set d [expr {$d+$cvd}]
+        }
+    }
+
+    if {$nq == 0 || $nz == 0 || $qvar_sum < 1e-12 || $zvar_sum < 1e-12} {
+        return [list $cvsm "unchanged" 0.0 0.0]
+    }
+
+    set qvar [expr {$qvar_sum/double($nq)}]
+    set zvar [expr {$zvar_sum/double($nz)}]
+    set qweight [expr {$qweight_sum/double($nq)}]
+    set target [expr {$qweight*$qvar/$zvar}]
+    if {$target < $cvsm_min} { set target $cvsm_min }
+    if {$target > $cvsm_max} { set target $cvsm_max }
+
+    set new_cvsm {}
+    for {set cv 0} {$cv < [llength $cvsd]} {incr cv} {
+        set old_weight [lindex $cvsm $cv]
+        if {[lindex $cvsd $cv] == 1} {
+            set new_weight [expr {(1.0-$cvsm_relaxation)*$old_weight + $cvsm_relaxation*$target}]
+            if {$new_weight < $cvsm_min} { set new_weight $cvsm_min }
+            if {$new_weight > $cvsm_max} { set new_weight $cvsm_max }
+            lappend new_cvsm $new_weight
+        } else {
+            lappend new_cvsm $old_weight
+        }
+    }
+
+    return [list $new_cvsm $target $qvar $zvar]
+}
+
+#proc normalize_colvars { mycolvars } {
+#    global cvsd
+#    set mycolvars_d 0
+#    foreach cvd $cvsd {
+#	if { $cvd == 4 } {
+#	    set q [list [lindex $mycolvars $mycolvars_d] [lindex $mycolvars [expr $mycolvars_d+1]] [lindex $mycolvars [expr $mycolvars_d+2]] [lindex $mycolvars [expr $mycolvars_d+3]]]
+#	    set norm [veclength $q]
+#            if { $norm < 1e-12 } { set norm 1.0 }
+#	    for { set dd $mycolvars_d } { $dd < [expr $mycolvars_d+4] } { incr dd } {
+#		lset mycolvars $dd [expr [lindex $mycolvars $dd]/$norm]
+#	    }
+#	}
+#	set mycolvars_d [expr $mycolvars_d+$cvd]
+#    }
+#    return $mycolvars
+#}
+
+proc normalize_colvars { mycolvars } {
+    global cvsd
+    set d 0
+    foreach cvd $cvsd {
+        if { $cvd == 4 } {
+            set q [list [lindex $mycolvars $d] [lindex $mycolvars [expr {$d+1}]] \
+                        [lindex $mycolvars [expr {$d+2}]] [lindex $mycolvars [expr {$d+3}]]]
+            set norm [veclength $q]
+            if { $norm < 1e-12 } { set norm 1.0 }
+            for {set k 0} {$k < 4} {incr k} {
+                lset mycolvars [expr {$d+$k}] [expr {[lindex $mycolvars [expr {$d+$k}]]/$norm}]
+            }
+            set d [expr {$d+4}]
+
+        } elseif { $cvd == 0 } {
+            # periodic scalar stored as (sin,cos): normalize to unit circle
+            set s [lindex $mycolvars $d]
+            set c [lindex $mycolvars [expr {$d+1}]]
+            set norm [expr {sqrt($s*$s + $c*$c)}]
+            if { $norm < 1e-12 } { set norm 1.0 }
+            lset mycolvars $d         [expr {$s/$norm}]
+            lset mycolvars [expr {$d+1}] [expr {$c/$norm}]
+            set d [expr {$d+2}]
+
+        } else {
+            set d [expr {$d+$cvd}]
+        }
+    }
+    return $mycolvars
+}
+
+# for quaternions
+proc align_cv_vector { v_ref v_target } {
+    global cvsd
+    set d 0
+    set v_aligned {}
+    foreach cvd $cvsd {
+        if { $cvd == 4 } {
+            # Extract quaternions
+            set r0 [lindex $v_ref $d]; set r1 [lindex $v_ref [expr {$d+1}]]; set r2 [lindex $v_ref [expr {$d+2}]]; set r3 [lindex $v_ref [expr {$d+3}]]
+            set t0 [lindex $v_target $d]; set t1 [lindex $v_target [expr {$d+1}]]; set t2 [lindex $v_target [expr {$d+2}]]; set t3 [lindex $v_target [expr {$d+3}]]
+            
+            # Dot product
+            set dot [expr {$r0*$t0 + $r1*$t1 + $r2*$t2 + $r3*$t3}]
+            
+            # Align
+            if { $dot < 0.0 } {
+                lappend v_aligned [expr {-$t0}] [expr {-$t1}] [expr {-$t2}] [expr {-$t3}]
+            } else {
+                lappend v_aligned $t0 $t1 $t2 $t3
+            }
+            set d [expr {$d+4}]
+        } elseif { $cvd == 0 } {
+            # Periodic scalar
+            lappend v_aligned [lindex $v_target $d] [lindex $v_target [expr {$d+1}]]
+            set d [expr {$d+2}]
+        } else {
+            # Standard scalars/vectors
+            for {set k 0} {$k < $cvd} {incr k} {
+                lappend v_aligned [lindex $v_target [expr {$d+$k}]]
+            }
+            set d [expr {$d+$cvd}]
+        }
+    }
+    return $v_aligned
+}
+
+# Added by AF
+# Vector multiplication
+proc vecmul {A B} {
+    set C [list]
+    foreach a $A b $B { lappend C [expr {$a * $b}] }
+    return $C
+}
+
+# Vector square root
+proc vecsqrt {A} {
+    set C [list]
+    foreach a $A { lappend C [expr {sqrt($a)}] }
+    return $C
+}
+
+# Takes a mean vector and a stddev vector, returns a randomized vector
+proc gaussian {mean_vec stddev_vec} {
+    set dim [llength $mean_vec]
+    set X [generate_gaussian_vector $dim] ; # Random vector from N(0,1)
+    
+    # Calculate: mean + (stddev * X)
+    set random_part [vecmul $stddev_vec $X]
+    set final_vec [vecadd $mean_vec $random_part]
+    return $final_vec
+}
+
+# Generates a vector of random numbers from N(0,1)
+proc generate_gaussian_vector {dim} {
+    set C [list]
+    for {set i 0} {$i < $dim} {incr i} {
+        lappend C [gaussian_rand]
+    }
+    return $C
+}
+
+# Generates a single random number from N(0,1) using the Box-Muller
+proc gaussian_rand {} {
+    if {[info exists ::spare_gaussian]} {
+        set result $::spare_gaussian
+        unset ::spare_gaussian
+        return $result
+    }
+    while {1} {
+        set u1 [expr {2.0 * rand() - 1.0}]
+        set u2 [expr {2.0 * rand() - 1.0}]
+        set r_sq [expr {$u1*$u1 + $u2*$u2}]
+        if {$r_sq > 0.0 && $r_sq < 1.0} {
+            set fac [expr {sqrt(-2.0 * log($r_sq) / $r_sq)}]
+            set ::spare_gaussian [expr {$u1 * $fac}]
+            return [expr {$u2 * $fac}]
+        }
+    }
+}
+
+###############################################
+# Main Body
+if { $mins } {
+minimize 1000
+reinitvels 310.15
+} 
+
+set steps [expr {1 + ($runs-1)*$ns}]
+for { set step 0 } { $step < $steps } { incr step } {
+
+    # The initial coordinates give the first update.  Later updates use ns samples.
+    if { $step == 0 } {
+	set r 0
+	set samp 0
+	set first 1
+	set last 1
+    } else {
+	set r [expr {1 + int(($step-1)/$ns)}]
+	set samp [expr {($step-1)%$ns}]
+	set first [expr {$samp == 0}]
+	set last [expr {$samp == $ns-1}]
+    }
+
+# Drift
+    if { $r == 0 } {
+	run 0
+    }
+    set values ""
+    set idx 0
+    foreach cv $cvs {
+        set value [colvarvalue $cv]
+	set toks   [regexp -all -inline {\S+} $value]
+	set cvd    [lindex $cvsd $idx]
+        if { $cvd == 0 } {
+	   # periodic scalar in degrees -> store as (sin, cos)
+	   set ang [lindex $toks 0]
+	   set s   [expr {sin($::d2r * $ang)}]
+	   set c   [expr {cos($::d2r * $ang)}]
+	   append values "$s $c "
+        } else {
+            append values $toks " "
+        }
+        incr idx
+        #append values [regexp -all -inline {\S+} $value] " "
+    }
+    set values [string trimright $values]
+
+    replicaBarrier
+
+# Modified by AF
+# Update according to X'_i = normalize(avg(X_i) + alpha * sigma(X_i) * noise)
+    if { $replica_id > 0 } {
+        if {$debug} { print "Worker $replica_id is sending values: $values" }
+	replicaSend $values 0
+    } else {
+        # What master does
+	set recv_vec [normalize_colvars [split $values]]
+	if { $first } {
+	    set sumPos(0) $recv_vec
+	    if { $random_update == 1 } {
+		set sumPos2(0) [vecmul $recv_vec $recv_vec]
+	    }
+	} else {
+	    set recv_vec [align_cv_vector $sumPos(0) $recv_vec]
+	    set sumPos(0) [vecadd $sumPos(0) $recv_vec]
+	    if { $random_update == 1 } {
+		set sumPos2(0) [vecadd $sumPos2(0) [vecmul $recv_vec $recv_vec]]
+	    }
+	}
+
+	if { $nr > 1 } {
+	    for { set R 1 } { $R < $nr } { incr R } {
+		set I [expr $R/$nc]; # num. images
+		set J [expr $R%$nc]; # num. copies
+		set recv_vec [normalize_colvars [split [replicaRecv $R]]]
+		if { $first && $J == 0 } {
+		    set sumPos($I) $recv_vec
+		    if { $random_update == 1 } {
+			set sumPos2($I) [vecmul $recv_vec $recv_vec]
+		    }
+		} else {
+		    set recv_vec [align_cv_vector $sumPos($I) $recv_vec]
+		    set sumPos($I) [vecadd $sumPos($I) $recv_vec]
+		    if { $random_update == 1 } {
+			set sumPos2($I) [vecadd $sumPos2($I) [vecmul $recv_vec $recv_vec]]
+		    }
+		}
+	    }
+	}
+
+	if { $last } {
+	    if { $r == 0 } { set scale $nci } else { set scale $ncs }
+	    for { set I 0 } { $I < $ni } { incr I } {
+		set mean [vecscale $sumPos($I) $scale]
+		if { $random_update == 1 } {
+		    set mean2 [vecmul $mean $mean]
+		    set Ez2 [vecscale $sumPos2($I) $scale]
+		    set variance [vecsub $Ez2 $mean2]
+		    for {set k 0} {$k < [llength $variance]} {incr k} {
+			if {[lindex $variance $k] < 0} { lset variance $k 0.0 }
+		    }
+		    set rand_alpha [expr {1.0 - ((double($r) + 1.0) / double($runs)) * 1.5}]
+		    if { $rand_alpha < 0.0 } { set rand_alpha 0.0 }
+		    set scaledStd [vecscale [vecsqrt $variance] $rand_alpha]
+		    set colvars($I) [normalize_colvars [gaussian $mean $scaledStd]]
+		} else {
+		    set colvars($I) [normalize_colvars $mean]
+		}
+		print "Drifted Centers" $I $colvars($I)
+	    }
+	}
+
+    # AFX: Under-relax the swarm estimate and preserve quaternion signs.
+	if { $last } {
+	    for {set I 0} {$I < $ni} {incr I} {
+		if {[info exists string_center($I)]} {
+		    set drifted [align_cv_vector $string_center($I) $colvars($I)]
+		    # x_new = (1-c) x_old + c x_random; c=1 falls back to what we had before
+		    set colvars($I) [vecadd \
+			[vecscale $string_center($I) [expr {1.0-$update_fraction}]] \
+			[vecscale $drifted $update_fraction]]
+		    set colvars($I) [normalize_colvars $colvars($I)]
+		} else {
+		    set string_center($I) $colvars($I)
+		}
+		#print "AFX Updated Centers" $I $colvars($I)
+	    }
+        }
+  }
+
+# AF: I also fixed the end points in the drifting (the original code only fixes the end 
+# points in the smoothing and reparam steps.), so they do not move.
+
+    if { $replica_id == 0 && $last } {
+        # in the 1st iter, store the initial endpoints
+        if { $r == 0 } {
+            # AFX: Use the persisted string endpoints when restarting a job.
+            set fixed_center(0)   $string_center(0)
+            set fixed_center($ni1) $string_center($ni1)
+        }
+
+        # fix the end points to very initial iteration
+        if { $fixed_end == 1 } {
+            if {$debug} { print "Enforcing fixed endpoints." }
+            set colvars(0)   $fixed_center(0)
+            set colvars($ni1) $fixed_center($ni1)
+        }
+    }
+
+# END of AF
+
+# Smoothing
+    if { $replica_id == 0 && $last } {
+	if { ( $smooth > 0 ) && ( $r > 0 || $initial_reparam ) } {
+	    set colvarsS(0) $colvars(0)
+	    print "Smoothed Centers" 0 $colvarsS(0)
+	    for { set I 1 } { $I < $ni1 } { incr I } {
+		set Im [expr $I-1]
+		set Ip [expr $I+1]
+                set aligned_Im [align_cv_vector $colvars($I) $colvars($Im)]
+                set aligned_Ip [align_cv_vector $colvars($I) $colvars($Ip)]
+                # X_i^new = (1-smooth) X_i + (smooth/2)(X_{i-1} + X_{i+1})
+                set colvarsS($I) [vecadd [vecscale $colvars($I) $oneminussmooth] [vecscale [vecadd $aligned_Im $aligned_Ip] $halfsmooth]]
+		set colvarsS($I) [normalize_colvars $colvarsS($I)]
+		print "Smoothed Centers" $I $colvarsS($I)
+	    }
+	    set colvarsS($ni1) $colvars($ni1)
+	    print "Smoothed Centers" $ni1 $colvarsS($ni1)
+	} else {
+	    array set colvarsS [array get colvars]
+	}
+
+        # AFX: Balance quaternion and z contributions using the smoothed path.
+        if {$adaptive_cvsm} {
+            set current_path {}
+            for {set I 0} {$I < $ni} {incr I} {
+                lappend current_path $colvarsS($I)
+            }
+            set metric_result [estimate_cvsm $current_path]
+            set cvsm [lindex $metric_result 0]
+            print "Adaptive cvsm" $cvsm "target" [lindex $metric_result 1] \
+                "q_variance" [lindex $metric_result 2] "z_variance" [lindex $metric_result 3]
+        }
+    }
+
+# Reparametrize
+    
+    if { $replica_id == 0 && $last } {
+	if { $r > 0 || $initial_reparam } {
+	    set colvarsR(0) $colvarsS(0)
+	    print "Reparametrized Centers" 0 $colvarsS(0)
+	    set totlen(0) 0.0
+	    for { set I 1 } { $I < $ni } { incr I } {
+		set J [expr $I-1]
+                set colvarsS($I) [align_cv_vector $colvarsS($J) $colvarsS($I)]
+                # dx
+		set dx($I) [vecsub $colvarsS($I) $colvarsS($J)]
+                # ds
+		set ds($I) [colvars_length $dx($I)]
+		if { $ds($I) < 1e-12 } { set ds($I) 1e-12 }
+                # normalize
+		set dx($I) [vecscale $dx($I) [expr 1.0/$ds($I)]]
+		set totlen($I) [expr $totlen($J)+$ds($I)]
+	    }
+	    #if {$debug} { print "Iteration $r - Total String Length: $totlen($ni1)"}
+	    # Interpolation
+	    set dS [expr $totlen($ni1)/$ni1]
+	    set I 0
+	    set J 0
+	    while { $I < [expr $ni1-1] } {
+		incr I 1
+		set sm [expr $I*$dS]
+		while { $J < $ni1 && $sm > $totlen($J) } { 
+		    incr J 1 
+		}
+                # fixed as above
+		#while { $J < $ni && $sm > $totlen($J) } {
+		#    incr J 1
+		#}
+		set J1 [expr $J-1]
+                # Interpolate from colvarsS
+		set colvarsR($I) [vecadd $colvarsS($J1) [vecscale $dx($J) [expr $sm-$totlen($J1)]]]
+		set colvarsR($I) [normalize_colvars $colvarsR($I)]
+		print "Reparametrized Centers" $I $colvarsR($I)
+	    }
+	    set colvarsR($ni1) $colvarsS($ni1)
+	    print "Reparametrized Centers" $ni1 $colvarsR($ni1)
+	} else {
+	    array set colvarsR [array get colvarsS]
+	}
+
+        # AFX: Keep the centers used for this iteration for the next update.
+        for {set I 0} {$I < $ni} {incr I} {
+            set string_center($I) $colvarsR($I)
+        }
+    }
+
+# Update the centers
+
+    if { $last } {
+	replicaBarrier
+
+	if { $replica_id > 0 } {
+	    set colvarsR($image_id) [split [replicaRecv 0]]
+	} else {
+	    for { set R 1 } { $R < $nr } { incr R } {
+		set I [expr $R/$nc]
+		set values ""
+		foreach value $colvarsR($I) {
+		    append values $value " "
+		}
+		set values [string trimright $values]
+		replicaSend $values $R
+	    }
+	}
+	set centers($image_id) [replica_centers $colvarsR($image_id)]
+    }
+    
+# Equilibration
+
+    eval colvarbias [concat changeconfig $centers($image_id)]
+    # Modified by AF: stage-equlibrium
+    for { set i 1 } { $i <= $num_equil_stages } { incr i } {
+	set current_force [expr pow(1.0 - ($num_equil_stages. - $i) / $num_equil_stages, $equil_stage_expon) * $force]
+    	eval colvarbias [concat changeconfig [list $harm "forceConstant $current_force"]]
+	run $equil_steps_per_stage
+    }
+    # END AF
+
+# Release
+    eval colvarbias [concat changeconfig [list $harm "forceConstant 0"]]
+    run $runR
+
+    # AFX: Save a small synchronized string state after a complete iteration.
+    replicaBarrier
+    if {$replica_id == 0 && $last} {
+        set center_state "${output_name}.job${job_id}.centers"
+        set center_state_tmp "${center_state}.tmp"
+        set fd [open $center_state_tmp w]
+        puts $fd "cvsm $cvsm"
+        for {set I 0} {$I < $ni} {incr I} {
+            puts $fd "$I $string_center($I)"
+        }
+        close $fd
+        file rename -force $center_state_tmp $center_state
+    }
+}
